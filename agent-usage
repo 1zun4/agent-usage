@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""agent-usage: what the AI agents that wrote a project cost, one JSON file per change.
+
+  agent-usage record <session logs or folders> [--from T] [--to T] [--change S] [--id HEX] [--dir D]
+  agent-usage check [--base REF] [--dir D]
+"""
+
+import argparse
+import gzip
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from dataclasses import dataclass
+from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
+
+USAGE_DIR = ".agent-usage"
+OLD_USAGE_DIR = "agent-usage"
+PRICE_URL = "https://models.dev/api.json"
+
+ROOT_FIELDS = ("date", "change", "tool", "models")
+MODEL_FIELDS = ("model", "provider", "tokens", "usd")
+TOKEN_FIELDS = ("input", "cachedInput", "cacheWrite", "output")
+
+FILE_NAME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})-[0-9a-f]{8}\.json")
+DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+HEX_ID = re.compile(r"[0-9a-f]{8}")
+class Failure(Exception):
+    """An error the user can fix; printed without a traceback."""
+
+
+def is_number(value):
+    return isinstance(value, (int, Decimal)) and not isinstance(value, bool)
+
+
+def child(value, key):
+    return value.get(key) if isinstance(value, dict) else None
+
+
+def count(usage, key):
+    value = child(usage, key)
+    return int(value) if is_number(value) else 0
+
+
+def tokens(input=0, cached_input=0, cache_write=0, output=0):
+    return {"input": input, "cachedInput": cached_input, "cacheWrite": cache_write, "output": output}
+
+
+def add_tokens(a, b):
+    return {key: a[key] + b[key] for key in TOKEN_FIELDS}
+
+
+def cents(usd):
+    return usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+# Session logs
+
+
+@dataclass
+class Turn:
+    """One model call. usd is None when the log has no cost; then priced_as names the model on the price list."""
+
+    time: datetime | None
+    tool: str
+    provider: str
+    model: str
+    tokens: dict
+    usd: Decimal | None
+    priced_as: str
+    cache_write_1h: int = 0
+
+
+@dataclass
+class SessionLog:
+    """The model calls in one omp or Claude Code JSONL log (.jsonl or .jsonl.gz)."""
+
+    file: Path
+    session_id: str | None
+    is_main: bool
+    title: str | None
+    turns: list
+
+
+def log_files(paths):
+    """The logs at paths: folders are searched, and a log file brings the subagent logs in the folder of its name."""
+    files = {}
+    for path in paths:
+        if path.is_dir():
+            files.update(dict.fromkeys(logs_under(path)))
+        elif path.is_file():
+            files[path.resolve()] = None
+            name = path.name.removesuffix(".gz").removesuffix(".jsonl")
+            if (path.parent / name).is_dir():
+                files.update(dict.fromkeys(logs_under(path.parent / name)))
+        else:
+            raise Failure(f"{path} does not exist.")
+    return list(files)
+
+
+def logs_under(folder):
+    found = [p.resolve() for p in folder.rglob("*") if p.is_file() and p.name.endswith((".jsonl", ".jsonl.gz"))]
+    return sorted(found, key=lambda p: (str(p).count(os.sep), str(p)))
+
+
+def instant(value):
+    """A timestamp with an offset, or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else None
+
+
+def model_name(model):
+    """The id as written in @agent tags: without provider prefix and release date (claude-opus-4-5-20251101)."""
+    return re.sub(r"-[0-9]{8}$", "", model.rsplit("/", 1)[-1])
+
+
+def omp_turn(entry, provider, model, usage):
+    if not isinstance(usage, dict) or not isinstance(model, str):
+        return None
+    counts = tokens(count(usage, "input"), count(usage, "cacheRead"), count(usage, "cacheWrite"), count(usage, "output"))
+    total = child(usage.get("cost"), "total")
+    usd = Decimal(total) if is_number(total) else Decimal(0)
+    if not any(counts.values()) and usd == 0:
+        return None
+    if not (isinstance(provider, str) and provider.strip()):
+        if "/" not in model:
+            raise Failure(f"No provider recorded for model {model}.")
+        provider = model.split("/", 1)[0]
+    return Turn(instant(entry.get("timestamp")), "omp", provider, model_name(model), counts, usd, model_name(model))
+
+
+def claude_turn(entry, message):
+    usage = message.get("usage")
+    model = message.get("model")
+    if not isinstance(usage, dict) or not isinstance(model, str):
+        return None
+    if model.startswith("<"):  # <synthetic>: local error messages, no API call
+        return None
+    counts = tokens(
+        count(usage, "input_tokens"),
+        count(usage, "cache_read_input_tokens"),
+        count(usage, "cache_creation_input_tokens"),
+        count(usage, "output_tokens"),
+    )
+    if not any(counts.values()):
+        return None
+    provider = model.split("/", 1)[0] if "/" in model else "anthropic"
+    return Turn(
+        instant(entry.get("timestamp")),
+        "claude-code",
+        provider,
+        model_name(model),
+        counts,
+        None,
+        model.rsplit("/", 1)[-1],
+        count(usage.get("cache_creation"), "ephemeral_1h_input_tokens"),
+    )
+
+
+def read_log(file):
+    """omp logs every assistant message and side call with tokens and cost. Claude Code logs tokens only and writes
+    one line per content block, so its calls are counted once per message id."""
+    session_id = None
+    is_main = True
+    title = None
+    turns = []
+    claude_messages = set()
+    opener = gzip.open if file.name.endswith(".gz") else open
+    with opener(file, "rt", encoding="utf-8") as lines:
+        for number, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line, parse_float=Decimal)
+            except ValueError as error:
+                raise Failure(f"{file}:{number} is not JSON: {error}") from error
+            if not isinstance(entry, dict):
+                continue
+            message = entry.get("message") if isinstance(entry.get("message"), dict) else None
+            kind = entry.get("type")
+            turn = None
+            if kind == "session":
+                session_id = entry.get("id") if isinstance(entry.get("id"), str) else None
+                is_main = entry.get("parentSession") is None
+            elif kind in ("title", "title_change", "summary"):
+                value = entry.get("title") if entry.get("title") is not None else entry.get("summary")
+                if isinstance(value, str) and value.strip():
+                    title = value
+            elif kind == "message" and message is not None and message.get("role") == "assistant":
+                turn = omp_turn(entry, message.get("provider"), message.get("model"), message.get("usage"))
+            elif kind == "model_usage":
+                turn = omp_turn(entry, entry.get("provider"), entry.get("model"), entry.get("usage"))
+            elif kind == "assistant" and message is not None:
+                if session_id is None and isinstance(entry.get("sessionId"), str):
+                    session_id = entry["sessionId"]
+                if entry.get("isSidechain") is True:
+                    is_main = False
+                message_id = message.get("id") if isinstance(message.get("id"), str) else None
+                if message_id is None or message_id not in claude_messages:
+                    claude_messages.add(message_id)
+                    turn = claude_turn(entry, message)
+            if turn is not None:
+                turns.append(turn)
+    return SessionLog(file, session_id, is_main, title, turns)
+
+
+class PriceList:
+    """List prices from models.dev in USD per million tokens, for logs that record tokens but no cost."""
+
+    def __init__(self, providers):
+        self.providers = providers
+
+    @classmethod
+    def fetch(cls):
+        try:
+            with urllib.request.urlopen(PRICE_URL, timeout=60) as response:
+                return cls(json.loads(response.read(), parse_float=Decimal))
+        except (OSError, ValueError) as error:
+            raise Failure(f"Could not download the price list {PRICE_URL}: {error}") from error
+
+    def usd(self, provider, model, counts, cache_write_1h):
+        """Anthropic bills cache writes kept for an hour at twice the input price."""
+        cost = child(child(child(self.providers, provider), "models"), model)
+        cost = child(cost, "cost")
+        if not isinstance(cost, dict):
+            raise Failure(
+                f"models.dev ({PRICE_URL}) has no price for {provider}/{model}. "
+                "Write this usage file by hand from the provider's prices."
+            )
+
+        def price(key):
+            value = cost.get(key)
+            return Decimal(value) if is_number(value) else None
+
+        input_price = price("input")
+        output_price = price("output")
+        if input_price is None:
+            raise Failure(f"models.dev lists no input price for {provider}/{model}.")
+        if output_price is None:
+            raise Failure(f"models.dev lists no output price for {provider}/{model}.")
+        cache_read = price("cache_read") if price("cache_read") is not None else input_price
+        cache_write = price("cache_write") if price("cache_write") is not None else input_price
+        total = (
+            input_price * counts["input"]
+            + cache_read * counts["cachedInput"]
+            + cache_write * (counts["cacheWrite"] - cache_write_1h)
+            + input_price * 2 * cache_write_1h
+            + output_price * counts["output"]
+        )
+        return total / Decimal(1_000_000)
+
+
+# Usage files
+
+
+def quote(text):
+    out = ['"']
+    for char in text:
+        if char == '"':
+            out.append('\\"')
+        elif char == "\\":
+            out.append("\\\\")
+        elif char == "\n":
+            out.append("\\n")
+        elif char < " ":
+            out.append(f"\\u{ord(char):04x}")
+        else:
+            out.append(char)
+    out.append('"')
+    return "".join(out)
+
+
+def usage_json(day, change, tool, models):
+    """The file text; models are (model, provider, tokens, usd) tuples."""
+    lines = ["{", f'  "date": {quote(day.isoformat())},', f'  "change": {quote(change)},', f'  "tool": {quote(tool)},']
+    lines.append('  "models": [')
+    for index, (model, provider, counts, usd) in enumerate(models):
+        lines += [
+            "    {",
+            f'      "model": {quote(model)},',
+            f'      "provider": {quote(provider)},',
+            f'      "tokens": {{ "input": {counts["input"]}, "cachedInput": {counts["cachedInput"]}, '
+            f'"cacheWrite": {counts["cacheWrite"]}, "output": {counts["output"]} }},',
+            f'      "usd": {cents(usd):f}',
+            "    }" if index == len(models) - 1 else "    },",
+        ]
+    lines += ["  ]", "}"]
+    return "\n".join(lines) + "\n"
+
+
+def option_time(text, option):
+    """An ISO time; without an offset it is local time, a date alone its start."""
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise Failure(
+            f"{option} {text} is not an ISO time like 2026-11-13T14:05:00Z, 2026-11-13T15:05 or 2026-11-13."
+        ) from None
+    return parsed if parsed.tzinfo else parsed.astimezone()
+
+
+def record(paths, directory, start=None, end=None, change=None, file_id=None, prices=PriceList.fetch):
+    """Writes a usage file from session logs and returns its path, the logs and the models written."""
+    logs = [read_log(file) for file in log_files(paths)]
+    turns = [
+        turn
+        for log in logs
+        for turn in log.turns
+        if (start is None and end is None)
+        or (turn.time is not None and (start is None or turn.time >= start) and (end is None or turn.time <= end))
+    ]
+    if not turns:
+        between = " between --from and --to." if start is not None or end is not None else "."
+        raise Failure(f"No model calls found in {', '.join(map(str, paths))}{between}")
+
+    main = next((log for log in logs if log.is_main and log.session_id), None) or next(
+        (log for log in logs if log.session_id), None
+    )
+    if file_id is None and main is not None:
+        file_id = "".join(char for char in main.session_id if char.isalnum()).lower()[:8]
+    if file_id is None or not HEX_ID.fullmatch(file_id):
+        raise Failure("The logs name no session id with 8 hex digits; pass --id <8 lowercase hex> (any random ones).")
+    if change is None or not change.strip():
+        if main is None or main.title is None:
+            raise Failure('The session has no title; pass --change "type(scope): subject" of the change.')
+        change = main.title.strip()
+
+    price_list = None
+    groups = {}
+    for turn in turns:
+        if turn.usd is None and price_list is None:
+            price_list = prices()
+        usd = turn.usd if turn.usd is not None else price_list.usd(
+            turn.provider, turn.priced_as, turn.tokens, turn.cache_write_1h
+        )
+        model, provider, counts, total, tools = groups.get(
+            (turn.provider, turn.model), (turn.model, turn.provider, tokens(), Decimal(0), set())
+        )
+        groups[(turn.provider, turn.model)] = (model, provider, add_tokens(counts, turn.tokens), total + usd, tools | {turn.tool})
+    # Models that cost nothing (free tiers, local models) are left out
+    kept = sorted((group for group in groups.values() if cents(group[3]) > 0), key=lambda group: group[3], reverse=True)
+    if not kept:
+        raise Failure("Every model call in these logs cost $0.00, so there is nothing to record.")
+
+    times = [turn.time for turn in turns if turn.time is not None]
+    day = max(times).astimezone().date() if times else date.today()
+    tool = ", ".join(sorted(set().union(*(group[4] for group in kept))))
+    models = [group[:4] for group in kept]
+    file = directory / f"{day.isoformat()}-{file_id}.json"
+    if file.exists():
+        raise Failure(
+            f"{file} already exists, and usage files are never overwritten. "
+            "If it is another change from the same session, pass --id <8 lowercase hex> (any random ones)."
+        )
+    directory.mkdir(parents=True, exist_ok=True)
+    file.write_text(usage_json(day, change, tool, models), encoding="utf-8")
+    return file, logs, turns, models
+
+
+def validate(name, data):
+    """What is wrong with a parsed usage file named name; empty when it is valid."""
+    problems = []
+    name_match = FILE_NAME.fullmatch(name)
+    if name_match is None:
+        problems.append("the name is not `<yyyy-mm-dd>-<8 lowercase hex>.json`")
+    if not isinstance(data, dict):
+        return problems + ["the file is not a JSON object"]
+
+    def only(node, path, fields):
+        problems.extend(f"unknown field `{path}{key}`" for key in node if key not in fields)
+
+    def need(node, path, field, expected, valid):
+        if field not in node:
+            problems.append(f"`{path}{field}` is missing")
+        elif not valid(node[field]):
+            problems.append(f"`{path}{field}` must be {expected}")
+
+    def text(value):
+        return isinstance(value, str) and value.strip() != ""
+
+    only(data, "", ROOT_FIELDS)
+    need(data, "", "date", "a string `yyyy-mm-dd`", is_date)
+    if name_match and is_date(data.get("date")) and name_match.group(1) != data["date"]:
+        problems.append(f"the name starts with {name_match.group(1)} but `date` is {data['date']}")
+    need(data, "", "change", "a non-empty string", text)
+    need(data, "", "tool", "a non-empty string", text)
+    need(data, "", "models", "a non-empty array", lambda value: isinstance(value, list) and value)
+
+    for index, usage in enumerate(data["models"] if isinstance(data.get("models"), list) else []):
+        if not isinstance(usage, dict):
+            problems.append(f"`models[{index}]` must be an object")
+            continue
+        path = f"models[{index}]."
+        only(usage, path, MODEL_FIELDS)
+        need(usage, path, "model", "a non-empty string", text)
+        need(usage, path, "provider", "a non-empty string", text)
+        need(usage, path, "usd", "a number >= 0", lambda value: is_number(value) and value >= 0)
+        need(usage, path, "tokens", "an object", lambda value: isinstance(value, dict))
+        if isinstance(usage.get("tokens"), dict):
+            only(usage["tokens"], f"{path}tokens.", TOKEN_FIELDS)
+            for field in TOKEN_FIELDS:
+                need(usage["tokens"], f"{path}tokens.", field, "an integer >= 0", is_count)
+    return problems
+
+
+def is_count(value):
+    return is_number(value) and value >= 0 and value == int(value)
+
+
+def is_date(value):
+    if not isinstance(value, str) or not DATE.fullmatch(value):
+        return False
+    try:
+        date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def default_usage_dir():
+    """.agent-usage, or agent-usage when only that folder exists in the working directory."""
+    if Path(OLD_USAGE_DIR).is_dir() and not Path(USAGE_DIR).exists():
+        return Path(OLD_USAGE_DIR)
+    return Path(USAGE_DIR)
+
+
+def usage_files(directory):
+    if not directory.is_dir():
+        return []
+    return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix == ".json" and p.name != "schema.json")
+
+
+def load(file):
+    return json.loads(file.read_text(encoding="utf-8"), parse_float=Decimal)
+
+
+def git(root, *args):
+    """git's stdout, or None when it fails or git is missing."""
+    try:
+        result = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+    except OSError:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def check(root, directory, base):
+    """Every problem in the usage files, as messages; empty when all is well.
+
+    Usage files at the base are never changed. This rule is skipped when the base ref is missing.
+    """
+    problems = []
+    folder = directory.relative_to(root).as_posix() if directory.is_relative_to(root) else str(directory)
+
+    schema_file = directory / "schema.json"
+    if schema_file.is_file():
+        problems += schema_problems(folder, load(schema_file))
+
+    files = usage_files(directory)
+    for file in files:
+        try:
+            data = load(file)
+        except ValueError as error:
+            problems.append(f"{folder}/{file.name}: not valid JSON ({error}).")
+            continue
+        problems += [f"{folder}/{file.name}: {problem}." for problem in validate(file.name, data)]
+    problems += base_problems(root, folder, base)
+    return problems
+
+
+def schema_problems(folder, schema):
+    model = child(child(child(schema, "properties"), "models"), "items")
+    token_node = child(child(model, "properties"), "tokens")
+    problems = []
+    for what, node, fields in (
+        ("the file", schema, ROOT_FIELDS),
+        ("models[]", model, MODEL_FIELDS),
+        ("tokens", token_node, TOKEN_FIELDS),
+    ):
+        required = [str(field) for field in child(node, "required") or []]
+        if set(required) != set(fields):
+            problems.append(
+                f"{folder}/schema.json requires {required} for {what}, but agent-usage checks {list(fields)}. "
+                "Replace it with the schema.json of agent-usage."
+            )
+    return problems
+
+
+def base_problems(root, folder, base):
+    merge_base = None
+    if git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}") is not None:
+        merge_base = (git(root, "merge-base", base, "HEAD") or "").strip()
+    if not merge_base:
+        print(f"agent-usage: no commit {base} with a merge base on HEAD, so changes against it are not checked.", file=sys.stderr)
+        return []
+
+    problems = []
+    base_files = [
+        path
+        for path in (git(root, "ls-tree", "-r", "--name-only", merge_base, "--", f"{folder}/") or "").splitlines()
+        if path.endswith(".json") and path != f"{folder}/schema.json"
+    ]
+    for path in base_files:
+        if not (root / path).is_file():
+            change = "was deleted"
+        elif git(root, "diff", "--quiet", merge_base, "--", path) is None:
+            change = "was changed"
+        else:
+            continue
+        problems.append(
+            f"{path} {change}, but files in {folder}/ are never edited or removed. "
+            f"Restore it (git checkout {base} -- {path}) and add a new file for this change."
+        )
+
+    return problems
+
+
+# Command line
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="agent-usage", description="What the AI agents that wrote a project cost.")
+    parser.add_argument(
+        "--dir", type=Path, help=f"the usage folder (default {USAGE_DIR}, or {OLD_USAGE_DIR} when only that exists)"
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    record_parser = commands.add_parser("record", help="write a usage file from omp or Claude Code session logs")
+    record_parser.add_argument("paths", nargs="+", type=Path, help="session logs (.jsonl, .jsonl.gz) or folders")
+    record_parser.add_argument("--from", dest="start", help="first model call to count, ISO time")
+    record_parser.add_argument("--to", dest="end", help="last model call to count, ISO time")
+    record_parser.add_argument("--change", help="the commit subject (default: the session title)")
+    record_parser.add_argument("--id", dest="file_id", help="8 lowercase hex digits (default: from the session id)")
+
+    check_parser = commands.add_parser("check", help="check the usage files")
+    check_parser.add_argument("--base", default="origin/main", help="git ref the change is compared with")
+    args = parser.parse_args(argv)
+    args.dir = args.dir or default_usage_dir()
+    try:
+        if args.command == "record":
+            start = option_time(args.start, "--from") if args.start else None
+            end = option_time(args.end, "--to") if args.end else None
+            paths = [path.expanduser() for path in args.paths]
+            file, logs, turns, models = record(paths, args.dir, start, end, args.change, args.file_id)
+            print(f"Wrote {file} from {len(logs)} logs, {len(turns)} model calls:")
+            for model, provider, counts, usd in models:
+                print(
+                    f"  {provider}/{model}: {cents(usd)} USD, {counts['input']} input, {counts['cachedInput']} cached "
+                    f"input, {counts['cacheWrite']} cache write, {counts['output']} output"
+                )
+        else:
+            root = Path.cwd().resolve()
+            problems = check(root, (root / args.dir).resolve(), args.base)
+            if problems:
+                print("agent-usage check failed:\n" + "\n".join(f"- {problem}" for problem in problems), file=sys.stderr)
+                return 1
+            print(f"agent-usage check passed ({len(usage_files(root / args.dir))} usage files).")
+    except Failure as failure:
+        print(f"agent-usage: {failure}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
