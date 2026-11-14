@@ -3,10 +3,12 @@
 """agent-usage: what the AI agents that wrote a project cost, one JSON file per change.
 
   agent-usage record <session logs or folders> [--from T] [--to T] [--change S] [--id HEX] [--dir D]
-  agent-usage check [--base REF] [--dir D]
+  agent-usage check [--base REF] [--include GLOB] [--exclude GLOB] [--style GLOB=STYLE] [--dir D]
+  agent-usage summary [--update FILE] [--dir D]
 """
 
 import argparse
+import fnmatch
 import gzip
 import json
 import os
@@ -30,6 +32,13 @@ TOKEN_FIELDS = ("input", "cachedInput", "cacheWrite", "output")
 FILE_NAME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})-[0-9a-f]{8}\.json")
 DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 HEX_ID = re.compile(r"[0-9a-f]{8}")
+# A lowercase name, then hyphenated parts of which at least one holds a version number
+MODEL_ID = re.compile(r"[a-z][a-z0-9]*(-[a-z0-9.]*[a-z0-9])*-[a-z]*[0-9][a-z0-9.]*(-[a-z0-9.]*[a-z0-9])*")
+
+SUMMARY_START = "<!-- agent-usage -->"
+SUMMARY_END = "<!-- /agent-usage -->"
+
+
 class Failure(Exception):
     """An error the user can fix; printed without a traceback."""
 
@@ -444,6 +453,132 @@ def load(file):
     return json.loads(file.read_text(encoding="utf-8"), parse_float=Decimal)
 
 
+# Doc comments
+
+
+def strip_block(line):
+    return line.strip().removeprefix("/**").removesuffix("*/").strip().removeprefix("*").strip()
+
+
+def block_comments(lines):
+    """/** ... */ comments: KDoc, Javadoc, JSDoc, TSDoc, PHPDoc, Doxygen."""
+    comments = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].lstrip().startswith("/**"):
+            index += 1
+            continue
+        comment = []
+        while index < len(lines):
+            comment.append((index + 1, strip_block(lines[index])))
+            if "*/" in lines[index]:
+                break
+            index += 1
+        index += 1
+        comments.append(comment)
+    return comments
+
+
+def rust_comments(lines):
+    """Runs of /// or //! lines, plus /** */ blocks."""
+    comments = block_comments(lines)
+    run = []
+    for number, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if (stripped.startswith("///") and not stripped.startswith("////")) or stripped.startswith("//!"):
+            run.append((number, stripped[3:].strip()))
+        elif run:
+            comments.append(run)
+            run = []
+    if run:
+        comments.append(run)
+    return comments
+
+
+DOCSTRING = re.compile(r"""^\s*[rRuU]?(\"\"\"|''')""")
+
+
+def python_comments(lines):
+    """Triple-quoted strings that start a line.
+
+    shortcut: any such string counts as a docstring, not only the first statement of a module, class or def;
+    parse with ast if a project keeps @-lines in other triple-quoted strings.
+    """
+    comments = []
+    index = 0
+    while index < len(lines):
+        match = DOCSTRING.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        quote_mark = match.group(1)
+        comment = []
+        body = lines[index][match.end():]
+        while True:
+            end = body.find(quote_mark)
+            comment.append((index + 1, (body if end < 0 else body[:end]).strip()))
+            if end >= 0 or index + 1 >= len(lines):
+                break
+            index += 1
+            body = lines[index]
+        index += 1
+        comments.append(comment)
+    return comments
+
+
+STYLES = {"block": block_comments, "rust": rust_comments, "python": python_comments}
+EXTENSION_STYLES = {
+    **dict.fromkeys(
+        ".kt .kts .java .scala .groovy .js .jsx .mjs .cjs .ts .tsx .mts .cts .php .c .h .cc .cpp .hpp .swift".split(),
+        "block",
+    ),
+    ".rs": "rust",
+    ".py": "python",
+    ".pyi": "python",
+}
+
+
+def doc_tags(comments):
+    """(line, tag) of every line starting with @ in the comments, outside ``` code blocks, per comment."""
+    result = []
+    for comment in comments:
+        tags = []
+        in_code = False
+        for number, text in comment:
+            if text.startswith("```"):
+                in_code = not in_code
+            if not in_code and text.startswith("@"):
+                tags.append((number, text))
+        result.append(tags)
+    return result
+
+
+def is_agent_tag(tag):
+    return tag == "@agent" or tag.startswith("@agent ")
+
+
+def agent_tags(path, lines, style):
+    """The @agent tags in a file as (line, model or None when malformed), and its placement problems."""
+    found = []
+    problems = []
+    for tags in doc_tags(STYLES[style](lines)):
+        first = next((i for i, (_, tag) in enumerate(tags) if is_agent_tag(tag)), None)
+        if first is None:
+            continue
+        for number, tag in tags[first:]:
+            location = f"{path}:{number}"
+            if not is_agent_tag(tag):
+                problems.append(f"{location}: `{tag}` follows an @agent tag; @agent tags go last")
+                continue
+            model = tag.removeprefix("@agent").strip()
+            if MODEL_ID.fullmatch(model):
+                found.append((number, model))
+            else:
+                problems.append(f"{location}: `{tag}` is not `@agent <name>-<version>`")
+                found.append((number, None))
+    return found, problems
+
+
 def git(root, *args):
     """git's stdout, or None when it fails or git is missing."""
     try:
@@ -453,10 +588,55 @@ def git(root, *args):
     return result.stdout if result.returncode == 0 else None
 
 
-def check(root, directory, base):
-    """Every problem in the usage files, as messages; empty when all is well.
+def source_files(root, includes, excludes, styles):
+    """(relative path, style) of the files to check: git's tracked and unignored files, or every file outside a git repo."""
+    listed = git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    if listed is not None:
+        paths = sorted({path for path in listed.split("\0") if path})
+    else:
+        paths = []
+        for folder, folders, files in os.walk(root):
+            folders[:] = [f for f in folders if not f.startswith(".") and f not in ("node_modules", "build", "target")]
+            paths += [Path(folder, f).relative_to(root).as_posix() for f in files]
+        paths.sort()
+    found = []
+    for path in paths:
+        if includes and not any(fnmatch.fnmatchcase(path, glob) for glob in includes):
+            continue
+        if any(fnmatch.fnmatchcase(path, glob) for glob in excludes):
+            continue
+        style = next((style for glob, style in styles if fnmatch.fnmatchcase(path, glob)), None)
+        style = style or EXTENSION_STYLES.get(os.path.splitext(path)[1])
+        if style and (root / path).is_file():
+            found.append((path, style))
+    return found
 
-    Usage files at the base are never changed. This rule is skipped when the base ref is missing.
+
+def added_lines(root, merge_base):
+    """Lines added since merge_base per file; None for untracked files, which are new as a whole."""
+    added = {}
+    file = None
+    line = 0
+    for diff_line in (git(root, "diff", "-U0", "--no-color", "--no-ext-diff", merge_base) or "").splitlines():
+        if diff_line.startswith("+++ "):
+            file = diff_line[4:].removeprefix("b/")
+        elif diff_line.startswith("@@"):
+            match = re.search(r"\+([0-9]+)", diff_line)
+            line = int(match.group(1)) if match else 0
+        elif diff_line.startswith("+"):
+            added.setdefault(file, set()).add(line)
+            line += 1
+    for path in (git(root, "ls-files", "--others", "--exclude-standard") or "").splitlines():
+        if path:
+            added[path] = None
+    return added
+
+
+def check(root, directory, base, includes=(), excludes=(), styles=()):
+    """Every problem in the usage files and @agent tags, as messages; empty when all is well.
+
+    Usage files at the base are never changed, a change that adds or changes @agent tags adds a usage file, and
+    every model in an @agent tag has a usage file. The base rules are skipped when the base ref is missing.
     """
     problems = []
     folder = directory.relative_to(root).as_posix() if directory.is_relative_to(root) else str(directory)
@@ -466,6 +646,7 @@ def check(root, directory, base):
         problems += schema_problems(folder, load(schema_file))
 
     files = usage_files(directory)
+    used_models = set()
     for file in files:
         try:
             data = load(file)
@@ -473,7 +654,29 @@ def check(root, directory, base):
             problems.append(f"{folder}/{file.name}: not valid JSON ({error}).")
             continue
         problems += [f"{folder}/{file.name}: {problem}." for problem in validate(file.name, data)]
-    problems += base_problems(root, folder, base)
+        for usage in child(data, "models") if isinstance(child(data, "models"), list) else []:
+            if isinstance(child(usage, "model"), str):
+                used_models.add(usage["model"])
+
+    tags = []
+    for path, style in source_files(root, includes, excludes, styles):
+        lines = (root / path).read_text(encoding="utf-8", errors="replace").splitlines()
+        found, tag_problems = agent_tags(path, lines, style)
+        problems += tag_problems
+        tags += [(path, number, model) for number, model in found]
+
+    unused = {}
+    for path, number, model in tags:
+        if model is not None and model not in used_models:
+            unused.setdefault(model, []).append(f"{path}:{number}")
+    for model, places in unused.items():
+        more = f" and {len(places) - 1} more" if len(places) > 1 else ""
+        problems.append(
+            f"Model `{model}` is named in @agent tags ({places[0]}{more}) but in no {folder} file. "
+            f"Add a usage file with its tokens and cost: agent-usage record <session log>, or write one by hand."
+        )
+
+    problems += base_problems(root, folder, base, {f"{folder}/{file.name}" for file in files}, tags)
     return problems
 
 
@@ -495,7 +698,7 @@ def schema_problems(folder, schema):
     return problems
 
 
-def base_problems(root, folder, base):
+def base_problems(root, folder, base, files, tags):
     merge_base = None
     if git(root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}") is not None:
         merge_base = (git(root, "merge-base", base, "HEAD") or "").strip()
@@ -521,10 +724,82 @@ def base_problems(root, folder, base):
             f"Restore it (git checkout {base} -- {path}) and add a new file for this change."
         )
 
+    added = added_lines(root, merge_base)
+    changed = next(
+        (f"{path}:{number}" for path, number, _ in tags if path in added and (added[path] is None or number in added[path])),
+        None,
+    )
+    if changed is not None and not files - set(base_files):
+        problems.append(
+            f"This change adds or changes @agent tags ({changed}) but adds no {folder} file. "
+            "Run agent-usage record <session log> and commit the new file."
+        )
     return problems
 
 
+# Summary
+
+
+def totals(directory):
+    """Sums per model and provider, the most expensive first, and the number of files and their first and last date."""
+    sums = {}
+    dates = []
+    for file in usage_files(directory):
+        try:
+            data = load(file)
+        except ValueError as error:
+            raise Failure(f"{file} is not valid JSON ({error}); run agent-usage check.") from error
+        if validate(file.name, data):
+            raise Failure(f"{file} is not a valid usage file; run agent-usage check.")
+        dates.append(data["date"])
+        for usage in data["models"]:
+            key = (usage["model"], usage["provider"])
+            counts, usd = sums.get(key, (tokens(), Decimal(0)))
+            sums[key] = (add_tokens(counts, {k: int(v) for k, v in usage["tokens"].items()}), usd + usage["usd"])
+    rows = sorted(((m, p, c, u) for (m, p), (c, u) in sums.items()), key=lambda row: (-row[3], row[0], row[1]))
+    return rows, len(dates), min(dates, default=None), max(dates, default=None)
+
+
+def summary_table(directory):
+    rows, changes, first, last = totals(directory)
+    if not rows:
+        raise Failure(f"{directory} holds no usage files.")
+    total = tokens()
+    lines = [
+        "| Model | Provider | Input | Cached input | Cache write | Output | USD |",
+        "| --- | --- | --: | --: | --: | --: | --: |",
+    ]
+    for model, provider, counts, usd in rows:
+        total = add_tokens(total, counts)
+        lines.append(f"| {model} | {provider} | " + " | ".join(f"{counts[k]:,}" for k in TOKEN_FIELDS) + f" | {cents(usd):,.2f} |")
+    usd = sum((row[3] for row in rows), Decimal(0))
+    lines.append("| **Total** | | " + " | ".join(f"**{total[k]:,}**" for k in TOKEN_FIELDS) + f" | **{cents(usd):,.2f}** |")
+    noun = "change" if changes == 1 else "changes"
+    lines += ["", f"{changes} {noun} from {first} to {last}, in USD at the providers' list prices."]
+    return "\n".join(lines) + "\n"
+
+
+def update_summary(file, table):
+    """Replaces the text between the summary markers in file; returns whether it changed."""
+    text = file.read_text(encoding="utf-8")
+    start = text.find(SUMMARY_START)
+    end = text.find(SUMMARY_END, start + 1)
+    if start < 0 or end < 0:
+        raise Failure(f"{file} has no {SUMMARY_START} ... {SUMMARY_END} block to put the summary in.")
+    updated = text[: start + len(SUMMARY_START)] + "\n" + table + text[end:]
+    if updated != text:
+        file.write_text(updated, encoding="utf-8")
+    return updated != text
+
+
 # Command line
+
+
+def style_option(text):
+    glob, _, style = text.rpartition("=")
+    if not glob or style not in STYLES:
+        raise argparse.ArgumentTypeError(f"expected GLOB=STYLE with STYLE one of {', '.join(STYLES)}")
+    return glob, style
 
 
 def main(argv=None):
@@ -541,8 +816,17 @@ def main(argv=None):
     record_parser.add_argument("--change", help="the commit subject (default: the session title)")
     record_parser.add_argument("--id", dest="file_id", help="8 lowercase hex digits (default: from the session id)")
 
-    check_parser = commands.add_parser("check", help="check the usage files")
+    check_parser = commands.add_parser("check", help="check the usage files and the @agent tags")
     check_parser.add_argument("--base", default="origin/main", help="git ref the change is compared with")
+    check_parser.add_argument("--include", action="append", default=[], help="glob of source files to check")
+    check_parser.add_argument("--exclude", action="append", default=[], help="glob of source files to skip")
+    check_parser.add_argument(
+        "--style", action="append", default=[], type=style_option, help=f"GLOB=STYLE, STYLE one of {', '.join(STYLES)}"
+    )
+
+    summary_parser = commands.add_parser("summary", help="totals per model as a markdown table")
+    summary_parser.add_argument("--update", type=Path, help=f"put the table between {SUMMARY_START} and {SUMMARY_END}")
+
     args = parser.parse_args(argv)
     args.dir = args.dir or default_usage_dir()
     try:
@@ -557,13 +841,20 @@ def main(argv=None):
                     f"  {provider}/{model}: {cents(usd)} USD, {counts['input']} input, {counts['cachedInput']} cached "
                     f"input, {counts['cacheWrite']} cache write, {counts['output']} output"
                 )
-        else:
+        elif args.command == "check":
             root = Path.cwd().resolve()
-            problems = check(root, (root / args.dir).resolve(), args.base)
+            problems = check(root, (root / args.dir).resolve(), args.base, args.include, args.exclude, args.style)
             if problems:
                 print("agent-usage check failed:\n" + "\n".join(f"- {problem}" for problem in problems), file=sys.stderr)
                 return 1
             print(f"agent-usage check passed ({len(usage_files(root / args.dir))} usage files).")
+        else:
+            table = summary_table(args.dir)
+            if args.update:
+                changed = update_summary(args.update, table)
+                print(f"{'Updated' if changed else 'Already current:'} {args.update}")
+            else:
+                print(table, end="")
     except Failure as failure:
         print(f"agent-usage: {failure}", file=sys.stderr)
         return 1

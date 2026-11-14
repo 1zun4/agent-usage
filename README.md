@@ -1,9 +1,10 @@
 # agent-usage
 
 Records what the AI agents that wrote a project cost: one JSON file per change in `.agent-usage/`, with the tokens
-and the list-price cost of each model, read from the agents' session logs. `check` validates the files.
+and the list-price cost of each model, read from the agents' session logs. `check` validates the files and the
+`@agent` tags that name the model behind a class or function; `summary` sums everything up for a README.
 
-One Python 3.11+ script, no dependencies.
+One Python 3.11+ script, no dependencies. Agents adding it to a project can follow [SKILL.md](SKILL.md).
 
 ## Install
 
@@ -60,6 +61,31 @@ omp logs carry the cost of each call. Claude Code logs only tokens, so they are 
 
 Fails when a usage file is malformed, or when a file that exists at the merge base with `--base` was edited or
 deleted. Without that ref the base rules are skipped.
+
+It also checks `@agent` tags in doc comments:
+
+- `@agent <model>` is the last tag of the comment, one tag per model (`@agent claude-opus-5-5`).
+- The model id is lowercase `name-version` without provider prefix: `claude-opus-5-5`, `gpt-5.6-sol`.
+- Every tagged model appears in some usage file.
+- A change that adds or changes `@agent` tags adds a usage file.
+
+Files come from `git ls-files` (tracked and unignored). The comment style follows the extension:
+
+| Style | Comments | Extensions |
+| --- | --- | --- |
+| `block` | `/** ... */` (KDoc, Javadoc, JSDoc, TSDoc, PHPDoc, Doxygen) | kt, kts, java, scala, groovy, js, jsx, mjs, cjs, ts, tsx, mts, cts, php, c, h, cc, cpp, hpp, swift |
+| `rust` | `///`, `//!` and `/** ... */` | rs |
+| `python` | triple-quoted strings that start a line | py, pyi |
+
+`--include GLOB` and `--exclude GLOB` narrow the files, `--style GLOB=STYLE` sets the style of other files. Globs
+match the path from the repository root, and `*` also matches `/`. All three can be repeated.
+
+## Summary
+
+```sh
+./agent-usage summary                    # prints a markdown table of the totals per model
+./agent-usage summary --update README.md # puts it between <!-- agent-usage --> and <!-- /agent-usage -->
+```
 
 ## License
 

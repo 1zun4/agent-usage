@@ -200,6 +200,90 @@ class RecordTest(unittest.TestCase):
             au.record([session], self.out, change="x", prices=no_prices)
 
 
+KOTLIN = """\
+/**
+ * A thing.
+ *
+ * @param x the x
+ * @agent model-1
+ */
+class A
+
+/** @agent other-2.5-fast */
+fun b() = Unit
+
+/**
+ * ```
+ * @agent not a tag in code
+ * ```
+ * @agent model-1
+ * @since 2
+ */
+fun c() = Unit
+
+/**
+ * @agent Model
+ */
+fun d() = Unit
+"""
+
+RUST = """\
+/// A thing.
+///
+/// @agent model-1
+pub struct A;
+
+//! @agent model-1
+//! @see b
+"""
+
+PYTHON = '''\
+def a():
+    """A thing.
+
+    @agent model-1
+    """
+
+
+class B:
+    """@agent model-2"""
+
+
+def c():
+    r"""
+    @agent model-1
+    @raises ValueError
+    """
+'''
+
+
+class AgentTagTest(unittest.TestCase):
+
+    def test_block_comments(self):
+        found, problems = au.agent_tags("A.kt", KOTLIN.splitlines(), "block")
+        self.assertEqual(found, [(5, "model-1"), (9, "other-2.5-fast"), (16, "model-1"), (22, None)])
+        self.assertEqual(problems, [
+            "A.kt:17: `@since 2` follows an @agent tag; @agent tags go last",
+            "A.kt:22: `@agent Model` is not `@agent <name>-<version>`",
+        ])
+
+    def test_rust_comments(self):
+        found, problems = au.agent_tags("a.rs", RUST.splitlines(), "rust")
+        self.assertEqual(found, [(3, "model-1"), (6, "model-1")])
+        self.assertEqual(problems, ["a.rs:7: `@see b` follows an @agent tag; @agent tags go last"])
+
+    def test_python_docstrings(self):
+        found, problems = au.agent_tags("a.py", PYTHON.splitlines(), "python")
+        self.assertEqual(found, [(4, "model-1"), (9, "model-2"), (14, "model-1")])
+        self.assertEqual(problems, ["a.py:15: `@raises ValueError` follows an @agent tag; @agent tags go last"])
+
+    def test_model_ids(self):
+        for model in ("claude-opus-5-5", "deepseek-v4.1-flash", "gpt-5.6-sol", "gemini-3-pro"):
+            self.assertTrue(au.MODEL_ID.fullmatch(model), model)
+        for model in ("claude", "Claude-5", "anthropic/claude-5", ""):
+            self.assertFalse(au.MODEL_ID.fullmatch(model), model)
+
+
 class CheckTest(unittest.TestCase):
 
     def setUp(self):
@@ -212,6 +296,7 @@ class CheckTest(unittest.TestCase):
         self.usage.mkdir()
         fixture = FIXTURES / "agent-usage" / "2026-11-09-6c84c195.json"
         (self.usage / fixture.name).write_bytes(fixture.read_bytes())
+        (self.root / "a.kt").write_text("/** @agent claude-opus-5-5 */\nclass A\n")
         self.git("add", ".")
         self.git("commit", "-q", "-m", "first")
         self.git("branch", "base")
@@ -222,10 +307,27 @@ class CheckTest(unittest.TestCase):
     def git(self, *args):
         subprocess.run(["git", *args], cwd=self.root, check=True)
 
-    def check(self):
-        return au.check(self.root, self.usage, "base")
+    def check(self, **options):
+        return au.check(self.root, self.usage, "base", **options)
 
     def test_clean(self):
+        self.assertEqual(self.check(), [])
+
+    def test_unknown_model(self):
+        (self.root / "b.ts").write_text("/**\n * @agent gpt-9.1\n */\nexport function b() {}\n")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "b")
+        problems = self.check()
+        self.assertEqual(len(problems), 2, problems)
+        self.assertTrue(problems[0].startswith("Model `gpt-9.1` is named in @agent tags (b.ts:2)"))
+        self.assertTrue(problems[1].startswith("This change adds or changes @agent tags (b.ts:2) but adds no .agent-usage file"))
+        self.assertEqual(self.check(excludes=["*.ts"]), [])
+
+    def test_new_tag_needs_a_new_file(self):
+        (self.root / "c.kt").write_text("/** @agent claude-opus-5-5 */\nclass C\n")
+        self.assertIn("(c.kt:1)", self.check()[0])
+        data = au.load(FIXTURES / "agent-usage" / "2026-11-13-1d037abe.json")
+        (self.usage / "2026-11-13-1d037abe.json").write_text(json.dumps(data, default=float))
         self.assertEqual(self.check(), [])
 
     def test_files_are_never_edited(self):
@@ -233,11 +335,18 @@ class CheckTest(unittest.TestCase):
         file.write_text(file.read_text().replace("399.41", "1"))
         self.assertTrue(self.check()[0].startswith(".agent-usage/2026-11-09-6c84c195.json was changed"))
         file.unlink()
-        self.assertTrue(self.check()[0].startswith(".agent-usage/2026-11-09-6c84c195.json was deleted"))
+        problems = self.check()
+        self.assertTrue(problems[0].startswith("Model `claude-opus-5-5`"))
+        self.assertTrue(problems[1].startswith(".agent-usage/2026-11-09-6c84c195.json was deleted"))
 
     def test_missing_base_skips_the_base_rules(self):
-        (self.usage / "2026-11-09-6c84c195.json").unlink()
+        (self.root / "c.kt").write_text("/** @agent claude-opus-5-5 */\nclass C\n")
         self.assertEqual(au.check(self.root, self.usage, "origin/nothing"), [])
+
+    def test_style_option(self):
+        (self.root / "d.txt").write_text("/** @agent Bad */\n")
+        self.assertEqual(self.check(), [])
+        self.assertIn("d.txt:1: `@agent Bad` is not `@agent <name>-<version>`", self.check(styles=[("*.txt", "block")]))
 
     def test_command_line(self):
         self.assertEqual(self.command("check", "--base", "base").returncode, 0)
@@ -249,8 +358,34 @@ class CheckTest(unittest.TestCase):
         self.usage.rename(self.root / "agent-usage")
         self.assertIn("(1 usage files)", self.command("check", "--base", "origin/nothing").stdout)
         (self.root / ".agent-usage").mkdir()
-        self.assertIn("(0 usage files)", self.command("check", "--base", "origin/nothing").stdout)
+        self.assertIn("in no .agent-usage file", self.command("check", "--base", "origin/nothing").stderr)
         self.assertIn("(1 usage files)", self.command("--dir", "agent-usage", "check", "--base", "origin/nothing").stdout)
+
+
+class SummaryTest(unittest.TestCase):
+
+    def test_table(self):
+        table = au.summary_table(FIXTURES / "agent-usage")
+        self.assertEqual(table, (
+            "| Model | Provider | Input | Cached input | Cache write | Output | USD |\n"
+            "| --- | --- | --: | --: | --: | --: | --: |\n"
+            "| claude-opus-5-5 | anthropic | 210,983 | 1,444,062,783 | 12,287,392 | 2,885,128 | 445.66 |\n"
+            "| claude-haiku-5-5 | anthropic | 847 | 0 | 0 | 6 | 0.00 |\n"
+            "| **Total** | | **211,830** | **1,444,062,783** | **12,287,392** | **2,885,134** | **445.66** |\n"
+            "\n"
+            "2 changes from 2026-11-09 to 2026-11-13, in USD at the providers' list prices.\n"
+        ))
+
+    def test_update(self):
+        with tempfile.TemporaryDirectory() as temp:
+            readme = Path(temp) / "README.md"
+            readme.write_text("# X\n\n<!-- agent-usage -->\nold\n<!-- /agent-usage -->\n\nmore\n")
+            self.assertTrue(au.update_summary(readme, "table\n"))
+            self.assertEqual(readme.read_text(), "# X\n\n<!-- agent-usage -->\ntable\n<!-- /agent-usage -->\n\nmore\n")
+            self.assertFalse(au.update_summary(readme, "table\n"))
+            readme.write_text("no markers\n")
+            with self.assertRaises(au.Failure):
+                au.update_summary(readme, "table\n")
 
 
 if __name__ == "__main__":
