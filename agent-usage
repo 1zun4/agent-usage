@@ -4,7 +4,7 @@
 
   agent-usage record <session logs or folders> [--from T] [--to T] [--change S] [--id HEX] [--dir D]
   agent-usage check [--base REF] [--include GLOB] [--exclude GLOB] [--style GLOB=STYLE] [--dir D]
-  agent-usage summary [--update FILE] [--dir D]
+  agent-usage summary [--update FILE | --json] [--related CHECKOUT|OWNER/REPO ...] [--dir D]
 """
 
 import argparse
@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -24,6 +25,11 @@ from pathlib import Path
 USAGE_DIR = ".agent-usage"
 OLD_USAGE_DIR = "agent-usage"
 PRICE_URL = "https://models.dev/api.json"
+GRAPHQL_URL = "https://api.github.com/graphql"
+REPO = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
+RELATED_ENV = "AGENT_USAGE_RELATED"
+CONFIG_FILE = "config.json"
+NOT_USAGE_FILES = ("schema.json", CONFIG_FILE)
 
 ROOT_FIELDS = ("date", "change", "tool", "models")
 MODEL_FIELDS = ("model", "provider", "tokens", "usd")
@@ -446,7 +452,7 @@ def default_usage_dir():
 def usage_files(directory):
     if not directory.is_dir():
         return []
-    return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix == ".json" and p.name != "schema.json")
+    return sorted(p for p in directory.iterdir() if p.is_file() and p.suffix == ".json" and p.name not in NOT_USAGE_FILES)
 
 
 def load(file):
@@ -644,6 +650,11 @@ def check(root, directory, base, includes=(), excludes=(), styles=()):
     schema_file = directory / "schema.json"
     if schema_file.is_file():
         problems += schema_problems(folder, load(schema_file))
+    if (directory / CONFIG_FILE).is_file():
+        try:
+            config_related(directory / CONFIG_FILE)
+        except Failure as failure:
+            problems.append(str(failure))
 
     files = usage_files(directory)
     used_models = set()
@@ -710,7 +721,7 @@ def base_problems(root, folder, base, files, tags):
     base_files = [
         path
         for path in (git(root, "ls-tree", "-r", "--name-only", merge_base, "--", f"{folder}/") or "").splitlines()
-        if path.endswith(".json") and path != f"{folder}/schema.json"
+        if path.endswith(".json") and path.rpartition("/")[2] not in NOT_USAGE_FILES
     ]
     for path in base_files:
         if not (root / path).is_file():
@@ -740,28 +751,161 @@ def base_problems(root, folder, base, files, tags):
 # Summary
 
 
-def totals(directory):
-    """Sums per model and provider, the most expensive first, and the number of files and their first and last date."""
+def config_related(file):
+    """The `related` list of a usage folder's config.json."""
+    try:
+        related = child(load(file), "related")
+    except ValueError as error:
+        raise Failure(f"{file} is not valid JSON ({error}).") from None
+    if not isinstance(related, list) or not all(isinstance(source, str) and source.strip() for source in related):
+        raise Failure(f'{file} must be {{"related": ["OWNER/REPO" or a checkout path, ...]}}.')
+    return related
+
+
+def related_sources(directory, flags=()):
+    """(label, base folder, source) of the related repositories: the usage folder's config.json (paths relative to
+    its checkout), then AGENT_USAGE_RELATED, then --related. Labels name the input and position, never the source."""
+    groups = []
+    config = directory / CONFIG_FILE
+    if config.is_file():
+        groups.append((f"{directory.name}/{CONFIG_FILE}", directory.resolve().parent, config_related(config)))
+    env = os.environ.get(RELATED_ENV)
+    if env is not None:
+        if not env.strip():
+            raise Failure(f"{RELATED_ENV} is set but empty; in CI that usually means its secret is missing.")
+        groups.append((RELATED_ENV, Path.cwd(), env.split()))
+    groups.append(("--related", Path.cwd(), list(flags)))
+    return [
+        (f"Related repository {number} of {where}", base, source)
+        for where, base, sources in groups
+        for number, source in enumerate(sources, 1)
+    ]
+
+
+def related_files(label, base, source):
+    """(name, text) of the usage files of a related repository, a local checkout or OWNER/REPO on GitHub."""
+    path = base / Path(source).expanduser()
+    if path.is_dir():
+        folder = path / USAGE_DIR if (path / USAGE_DIR).is_dir() else path / OLD_USAGE_DIR
+        files = [(file.name, file.read_text(encoding="utf-8")) for file in usage_files(folder)]
+    elif REPO.fullmatch(source):
+        files = github_files(label, source)
+    else:
+        raise Failure(f"{label} is neither a folder nor OWNER/REPO.")
+    if not files:
+        raise Failure(f"{label} has no usage files.")
+    return files
+
+
+def github_token():
+    """GH_TOKEN, GITHUB_TOKEN, or the token of a signed-in gh CLI."""
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if token:
+        return token
+    try:
+        return subprocess.run(["gh", "auth", "token"], capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return ""
+
+
+GITHUB_QUERY = """query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    current: object(expression: "HEAD:.agent-usage") { ...files }
+    old: object(expression: "HEAD:agent-usage") { ...files }
+  }
+}
+fragment files on Tree { entries { name type object { ... on Blob { text isTruncated } } } }"""
+
+
+def github_files(label, repo):
+    """The usage files on the default branch of repo, in one GraphQL request."""
+    token = github_token()
+    if not token:
+        raise Failure(
+            f"{label} is on GitHub, but no token is set. "
+            "Set GH_TOKEN or GITHUB_TOKEN to a token that can read its contents."
+        )
+    owner, name = repo.split("/")
+    request = urllib.request.Request(
+        GRAPHQL_URL,
+        data=json.dumps({"query": GITHUB_QUERY, "variables": {"owner": owner, "name": name}}).encode(),
+        headers={"Authorization": f"bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            reply = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        raise Failure(f"{label}: GitHub refused the request (HTTP {error.code}); check the token.") from None
+    except (OSError, ValueError) as error:
+        raise Failure(f"{label}: could not read it from GitHub ({error}).") from None
+    repository = child(child(reply, "data"), "repository")
+    if repository is None:
+        raise Failure(
+            f"{label} was not found on GitHub, or the token cannot read it. "
+            "Give the token read access to its contents."
+        )
+    files = []
+    for entry in child(repository.get("current") or repository.get("old"), "entries") or []:
+        if entry.get("type") != "blob" or not entry["name"].endswith(".json") or entry["name"] in NOT_USAGE_FILES:
+            continue
+        blob = entry.get("object") or {}
+        if not isinstance(blob.get("text"), str) or blob.get("isTruncated"):
+            raise Failure(f"{label}: GitHub did not return the whole text of a usage file.")
+        files.append((entry["name"], blob["text"]))
+    return files
+
+
+def repository_key(base, source):
+    """What tells repositories apart: the resolved path of a checkout, or owner/repo in lowercase."""
+    path = base / Path(source).expanduser()
+    return str(path.resolve()) if path.is_dir() else source.lower()
+
+
+def own_keys(directory):
+    """The keys of the repository that holds directory: its checkout and its GitHub origin."""
+    checkout = directory.resolve().parent
+    origin = (git(checkout, "remote", "get-url", "origin") or "").strip() if checkout.is_dir() else ""
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$", origin)
+    return {str(checkout)} | ({match.group(1).lower()} if match else set())
+
+
+def totals(directory, related=()):
+    """Sums per model and provider, the most expensive first, the number of files, how many of them come from
+    related repositories (related_sources, with the --related values), how many related repositories were counted,
+    and the first and last date. A repository listed twice, or the one holding directory, counts once."""
+    sources = [(str(file), file.name, file.read_text(encoding="utf-8")) for file in usage_files(directory)]
+    own = own_keys(directory)
+    seen = set(own)
+    related_changes = 0
+    for label, base, source in related_sources(directory, related):
+        key = repository_key(base, source)
+        if key in seen:
+            continue
+        seen.add(key)
+        files = related_files(label, base, source)
+        related_changes += len(files)
+        sources += [(f"{label}: a usage file", name, text) for name, text in files]
     sums = {}
     dates = []
-    for file in usage_files(directory):
+    for label, name, text in sources:
         try:
-            data = load(file)
+            data = json.loads(text, parse_float=Decimal)
         except ValueError as error:
-            raise Failure(f"{file} is not valid JSON ({error}); run agent-usage check.") from error
-        if validate(file.name, data):
-            raise Failure(f"{file} is not a valid usage file; run agent-usage check.")
+            raise Failure(f"{label} is not valid JSON ({error}); run agent-usage check.") from error
+        if validate(name, data):
+            raise Failure(f"{label} is not a valid usage file; run agent-usage check.")
         dates.append(data["date"])
         for usage in data["models"]:
             key = (usage["model"], usage["provider"])
             counts, usd = sums.get(key, (tokens(), Decimal(0)))
             sums[key] = (add_tokens(counts, {k: int(v) for k, v in usage["tokens"].items()}), usd + usage["usd"])
     rows = sorted(((m, p, c, u) for (m, p), (c, u) in sums.items()), key=lambda row: (-row[3], row[0], row[1]))
-    return rows, len(dates), min(dates, default=None), max(dates, default=None)
+    related_repos = len(seen) - len(own)
+    return rows, len(dates), related_changes, related_repos, min(dates, default=None), max(dates, default=None)
 
 
-def summary_table(directory):
-    rows, changes, first, last = totals(directory)
+def summary_table(directory, related=()):
+    rows, changes, related_changes, related_repos, first, last = totals(directory, related)
     if not rows:
         raise Failure(f"{directory} holds no usage files.")
     total = tokens()
@@ -775,8 +919,24 @@ def summary_table(directory):
     usd = sum((row[3] for row in rows), Decimal(0))
     lines.append("| **Total** | | " + " | ".join(f"**{total[k]:,}**" for k in TOKEN_FIELDS) + f" | **{cents(usd):,.2f}** |")
     noun = "change" if changes == 1 else "changes"
-    lines += ["", f"{changes} {noun} from {first} to {last}, in USD at the providers' list prices."]
+    repos = "repository" if related_repos == 1 else "repositories"
+    of_them = f", {related_changes} of them in {related_repos} related {repos}" if related_repos else ""
+    lines += ["", f"{changes} {noun} from {first} to {last}{of_them}, in USD at the providers' list prices."]
     return "\n".join(lines) + "\n"
+
+
+def summary_json(directory, related=()):
+    """The totals as JSON: usd, changes, relatedChanges, first, last and the models with tokens and usd."""
+    rows, changes, related_changes, _, first, last = totals(directory, related)
+    if not rows:
+        raise Failure(f"{directory} holds no usage files.")
+    models = [
+        {"model": model, "provider": provider, "tokens": counts, "usd": float(cents(usd))}
+        for model, provider, counts, usd in rows
+    ]
+    usd = float(cents(sum((row[3] for row in rows), Decimal(0))))
+    data = {"usd": usd, "changes": changes, "relatedChanges": related_changes, "first": first, "last": last, "models": models}
+    return json.dumps(data, indent=2) + "\n"
 
 
 def update_summary(file, table):
@@ -825,7 +985,17 @@ def main(argv=None):
     )
 
     summary_parser = commands.add_parser("summary", help="totals per model as a markdown table")
-    summary_parser.add_argument("--update", type=Path, help=f"put the table between {SUMMARY_START} and {SUMMARY_END}")
+    output = summary_parser.add_mutually_exclusive_group()
+    output.add_argument("--update", type=Path, help=f"put the table between {SUMMARY_START} and {SUMMARY_END}")
+    output.add_argument("--json", action="store_true", help="print the totals as JSON instead of a table")
+    summary_parser.add_argument(
+        "--related",
+        action="extend",
+        nargs="+",
+        default=[],
+        help=f"also count these repositories (checkouts or OWNER/REPO on GitHub), besides {RELATED_ENV} and the "
+        f"related list in the usage folder's {CONFIG_FILE}; never named in the output",
+    )
 
     args = parser.parse_args(argv)
     args.dir = args.dir or default_usage_dir()
@@ -848,13 +1018,13 @@ def main(argv=None):
                 print("agent-usage check failed:\n" + "\n".join(f"- {problem}" for problem in problems), file=sys.stderr)
                 return 1
             print(f"agent-usage check passed ({len(usage_files(root / args.dir))} usage files).")
+        elif args.json:
+            print(summary_json(args.dir, args.related), end="")
+        elif args.update:
+            changed = update_summary(args.update, summary_table(args.dir, args.related))
+            print(f"{'Updated' if changed else 'Already current:'} {args.update}")
         else:
-            table = summary_table(args.dir)
-            if args.update:
-                changed = update_summary(args.update, table)
-                print(f"{'Updated' if changed else 'Already current:'} {args.update}")
-            else:
-                print(table, end="")
+            print(summary_table(args.dir, args.related), end="")
     except Failure as failure:
         print(f"agent-usage: {failure}", file=sys.stderr)
         return 1

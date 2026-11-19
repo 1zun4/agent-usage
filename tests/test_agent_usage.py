@@ -2,11 +2,14 @@ import gzip
 import importlib.machinery
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -386,6 +389,141 @@ class SummaryTest(unittest.TestCase):
             readme.write_text("no markers\n")
             with self.assertRaises(au.Failure):
                 au.update_summary(readme, "table\n")
+
+
+SECRET_USAGE = {
+    "date": "2026-11-15",
+    "change": "feat(secret-addon): hidden feature",
+    "tool": "omp",
+    "models": [{"model": "gpt-5.6-sol", "provider": "openai", "tokens": {"input": 10, "cachedInput": 0, "cacheWrite": 0, "output": 5}, "usd": 1.5}],
+}
+
+
+class GitHubReply:
+    def __init__(self, data):
+        self.data = data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return json.dumps(self.data).encode()
+
+
+class RelatedTest(unittest.TestCase):
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.secret = Path(temp.name) / "secret-addon"
+        (self.secret / ".agent-usage").mkdir(parents=True)
+        (self.secret / ".agent-usage" / "2026-11-15-0badc0de.json").write_text(json.dumps(SECRET_USAGE))
+        self.own = Path(temp.name) / "own" / ".agent-usage"
+        shutil.copytree(FIXTURES / "agent-usage", self.own)
+        self.addCleanup(setattr, au.urllib.request, "urlopen", au.urllib.request.urlopen)
+        self.addCleanup(setattr, au, "github_token", au.github_token)
+        au.github_token = lambda: "token"
+        environment = mock.patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop(au.RELATED_ENV, None)
+
+    def reply(self, data):
+        au.urllib.request.urlopen = lambda request, timeout: GitHubReply(data)
+
+    def summary(self, *args, **env):
+        result = subprocess.run(
+            [str(ROOT / "agent-usage"), "--dir", str(FIXTURES / "agent-usage"), "summary", *args],
+            capture_output=True,
+            text=True,
+            env={**os.environ, **env},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def assert_private(self, text):
+        for secret in ("secret", "hidden", "0badc0de", "acme"):
+            self.assertNotIn(secret, text)
+
+    def test_checkout(self):
+        table = self.summary("--related", str(self.secret))
+        self.assertIn("| gpt-5.6-sol | openai | 10 | 0 | 0 | 5 | 1.50 |", table)
+        self.assertIn("| **Total** | | **211,840** | **1,444,062,783** | **12,287,392** | **2,885,139** | **447.16** |", table)
+        self.assertIn("3 changes from 2026-11-09 to 2026-11-15, 1 of them in 1 related repository,", table)
+        self.assert_private(table)
+
+    def test_json(self):
+        output = self.summary("--json", **{au.RELATED_ENV: str(self.secret)})
+        data = json.loads(output)
+        self.assertEqual((data["usd"], data["changes"], data["relatedChanges"]), (447.16, 3, 1))
+        self.assertEqual((data["first"], data["last"]), ("2026-11-09", "2026-11-15"))
+        self.assertEqual(data["models"][0]["model"], "claude-opus-5-5")
+        self.assert_private(output)
+
+    def github_entries(self):
+        return [
+            {"name": "2026-11-15-0badc0de.json", "type": "blob", "object": {"text": json.dumps(SECRET_USAGE), "isTruncated": False}},
+            {"name": "schema.json", "type": "blob", "object": {"text": "{}", "isTruncated": False}},
+        ]
+
+    def test_github(self):
+        self.reply({"data": {"repository": {"current": {"entries": self.github_entries()}, "old": None}}})
+        rows, changes, related, repos, _, last = au.totals(FIXTURES / "agent-usage", ["acme/secret-addon"])
+        self.assertEqual((changes, related, repos, last), (3, 1, 1, "2026-11-15"))
+        self.assertIn(("gpt-5.6-sol", "openai"), [row[:2] for row in rows])
+
+    def test_environment(self):
+        os.environ[au.RELATED_ENV] = f" {self.secret}  {self.secret}/ "
+        self.assertEqual(au.totals(FIXTURES / "agent-usage")[1:4], (3, 1, 1))
+        os.environ[au.RELATED_ENV] = " "
+        with self.assertRaisesRegex(au.Failure, "AGENT_USAGE_RELATED is set but empty"):
+            au.totals(FIXTURES / "agent-usage")
+
+    def test_config(self):
+        (self.own / "config.json").write_text('{"related": ["../secret-addon"]}')
+        self.assertNotIn(self.own / "config.json", au.usage_files(self.own))
+        self.assertEqual(au.totals(self.own)[1:4], (3, 1, 1))
+        (self.own / "config.json").write_text('{"related": "acme/secret-addon"}')
+        with self.assertRaisesRegex(au.Failure, "config.json must be"):
+            au.totals(self.own)
+        self.assertTrue(any("config.json must be" in problem for problem in au.check(self.own.parent, self.own, "none")))
+
+    def test_duplicates_count_once(self):
+        self.reply({"data": {"repository": {"current": {"entries": self.github_entries()}, "old": None}}})
+        (self.own / "config.json").write_text('{"related": ["../secret-addon", "acme/secret-addon"]}')
+        os.environ[au.RELATED_ENV] = f"{self.secret} ACME/Secret-Addon"
+        related = [f"{self.secret}/", "acme/secret-addon", str(self.own.parent)]
+        _, changes, related_changes, repos, _, _ = au.totals(self.own, related)
+        self.assertEqual((changes, related_changes, repos), (4, 2, 2))
+        self.assertIn("4 changes from 2026-11-09 to 2026-11-15, 2 of them in 2 related repositories,", au.summary_table(self.own, related))
+
+    def test_own_github_repository_is_skipped(self):
+        checkout = self.own.parent
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", "git@github.com:acme/Own.git"], check=True)
+        au.urllib.request.urlopen = None
+        self.assertEqual(au.totals(self.own, ["acme/own"])[1:4], (2, 0, 0))
+
+    def test_missing_access(self):
+        self.reply({"data": {"repository": None}, "errors": [{"message": "Could not resolve to a Repository with the name 'acme/secret-addon'."}]})
+        with self.assertRaisesRegex(au.Failure, "Related repository 2 of --related was not found") as caught:
+            au.summary_table(FIXTURES / "agent-usage", [str(self.secret), "acme/secret-addon"])
+        self.assert_private(str(caught.exception))
+
+        au.github_token = lambda: ""
+        with self.assertRaisesRegex(au.Failure, "Related repository 1 of --related is on GitHub, but no token is set") as caught:
+            au.summary_table(FIXTURES / "agent-usage", ["acme/secret-addon"])
+        self.assert_private(str(caught.exception))
+
+    def test_empty_or_unknown(self):
+        (self.secret / ".agent-usage" / "2026-11-15-0badc0de.json").unlink()
+        with self.assertRaisesRegex(au.Failure, "Related repository 1 of --related has no usage files"):
+            au.totals(FIXTURES / "agent-usage", [str(self.secret)])
+        with self.assertRaisesRegex(au.Failure, "Related repository 1 of --related is neither"):
+            au.totals(FIXTURES / "agent-usage", ["no such folder"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/1zun4/agent-usage/blob/main/summary.schema.json",
+  "title": "agent-usage summary --json",
+  "description": "Totals of a project's usage files and those of its related repositories. New fields may be added; existing ones keep their meaning.",
+  "type": "object",
+  "required": ["usd", "changes", "relatedChanges", "first", "last", "models"],
+  "properties": {
+    "usd": { "type": "number", "minimum": 0, "description": "Total cost in USD at the providers' list prices, rounded to cents." },
+    "changes": { "type": "integer", "minimum": 1, "description": "Usage files counted, related repositories included." },
+    "relatedChanges": { "type": "integer", "minimum": 0, "description": "How many of the changes come from related repositories." },
+    "first": { "type": "string", "format": "date", "description": "Date of the oldest change." },
+    "last": { "type": "string", "format": "date", "description": "Date of the newest change." },
+    "models": {
+      "type": "array",
+      "description": "Sums per model and provider, the most expensive first. Models that cost $0.00 are included.",
+      "items": {
+        "type": "object",
+        "required": ["model", "provider", "tokens", "usd"],
+        "properties": {
+          "model": { "type": "string" },
+          "provider": { "type": "string" },
+          "tokens": {
+            "type": "object",
+            "required": ["input", "cachedInput", "cacheWrite", "output"],
+            "properties": {
+              "input": { "type": "integer", "minimum": 0 },
+              "cachedInput": { "type": "integer", "minimum": 0 },
+              "cacheWrite": { "type": "integer", "minimum": 0 },
+              "output": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "usd": { "type": "number", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

@@ -9,7 +9,7 @@ One Python 3.11+ script, no dependencies. Agents adding it to a project can foll
 ## Install
 
 ```sh
-curl -fsSLo agent-usage https://raw.githubusercontent.com/1zun4/agent-usage/v1.0.0/agent-usage
+curl -fsSLo agent-usage https://raw.githubusercontent.com/1zun4/agent-usage/v1.1.0/agent-usage
 chmod +x agent-usage
 ```
 
@@ -85,7 +85,70 @@ match the path from the repository root, and `*` also matches `/`. All three can
 ```sh
 ./agent-usage summary                    # prints a markdown table of the totals per model
 ./agent-usage summary --update README.md # puts it between <!-- agent-usage --> and <!-- /agent-usage -->
+./agent-usage summary --json             # the totals as JSON, for sites and cards
 ```
+
+`--json` prints a stable format, described by [summary.schema.json](summary.schema.json); new fields may be added,
+existing ones keep their meaning:
+
+```json
+{
+  "usd": 4279.11,
+  "changes": 183,
+  "relatedChanges": 81,
+  "first": "2026-10-27",
+  "last": "2026-11-17",
+  "models": [
+    {
+      "model": "claude-opus-5-5",
+      "provider": "anthropic",
+      "tokens": { "input": 551748, "cachedInput": 11669343182, "cacheWrite": 111731510, "output": 26818051 },
+      "usd": 3766.36
+    }
+  ]
+}
+```
+
+`usd` and `models` are sums over every change counted, related repositories included; `changes` counts them all and
+`relatedChanges` those from related repositories. `models` holds one entry per model and provider, the most expensive
+first, models that cost $0.00 included.
+
+### Related repositories
+
+The totals can include other repositories, private ones too: local checkouts, or `OWNER/REPO` read from the default
+branch on GitHub. Three inputs name them, and all of them are used:
+
+- `related` in `.agent-usage/config.json`, for repositories whose names may be public. Paths are relative to the
+  repository root: `{ "related": ["my-org/public-addon", "../sibling-checkout"] }`.
+- `AGENT_USAGE_RELATED`: names separated by spaces. This is the way to keep private names out of a public
+  repository: set it from a CI secret. Set but empty fails, as an unset secret would otherwise go unnoticed.
+- `--related NAME ...` on the command line.
+
+A repository listed more than once, or the repository itself, counts once. The table footer and `--json` only add
+how many changes came from related repositories; names, files and change subjects never appear in the output, and
+errors name a repository only by its input and position (`Related repository 2 of AGENT_USAGE_RELATED`). A related
+repository that is missing, unreadable or has no usage files fails the command, so totals are never short.
+
+GitHub is read with `GH_TOKEN`, else `GITHUB_TOKEN`, else the login of the `gh` CLI. For private repositories use a
+fine-grained token with access to just those repositories and the permission Contents: read-only.
+
+A GitHub Actions step that writes the totals with private related repositories, with two repository secrets:
+`AGENT_USAGE_TOKEN` (the token above) and `AGENT_USAGE_RELATED` (`my-org/private-a my-org/private-b`). Secrets are
+masked in the public logs; repository variables are not.
+
+```yaml
+      - name: AI usage totals
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_USAGE_TOKEN }}
+          AGENT_USAGE_RELATED: ${{ secrets.AGENT_USAGE_RELATED }}
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/agent-usage" https://raw.githubusercontent.com/1zun4/agent-usage/v1.1.0/agent-usage
+          echo "c5c7a8335d239abcfea7ba5b61ff889b0903bb6f3543a903274aa8c33441f57d  $RUNNER_TEMP/agent-usage" | sha256sum -c -
+          python3 "$RUNNER_TEMP/agent-usage" summary --json > "$RUNNER_TEMP/ai-usage.json"
+```
+
+Secrets are not passed to workflows of pull requests from forks, so run it on pushes or on a schedule, not on
+`pull_request`.
 
 ## License
 
