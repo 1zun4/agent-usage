@@ -12,15 +12,16 @@ the files; README.md of this repository documents every option.
 ## Add it to a project
 
 1. Fetch the script at a pinned tag, either in CI on each run or vendored into the repository:
-   `curl -fsSLo agent-usage https://raw.githubusercontent.com/1zun4/agent-usage/v1.1.0/agent-usage`.
+   `curl -fsSLo agent-usage https://raw.githubusercontent.com/1zun4/agent-usage/v1.2.0/agent-usage`.
    Pin its checksum next to the download (`sha256sum -c`) so a moved tag fails the build.
 2. Create `.agent-usage/` with the `schema.json` of this repository in it (optional; when present, `check` makes
    sure it matches the format).
 3. Add a CI step that runs `agent-usage check --base origin/<target branch>` with the full history
    (`fetch-depth: 0`) and a `timeout-minutes`. Add `--include`, `--exclude` or `--style` when the defaults do not
    fit the project's sources.
-4. Put `<!-- agent-usage -->` and `<!-- /agent-usage -->` into README.md where the totals go, then run
-   `agent-usage summary --update README.md`.
+4. Show the totals in README.md as the card image: a GitHub Pages workflow runs
+   `agent-usage card --out <site> --name "<project>"` (README.md has it under Card) and the README embeds
+   `https://<owner>.github.io/<repo>/ai-usage-{dark,light}.svg` in a `<picture>`, linked to `.../ai-usage/`.
 5. Add the rules below to the project's AGENTS.md, with the commands as the project runs them.
 6. Optional: count related repositories in the totals (next section).
 
@@ -41,8 +42,8 @@ The totals can include other repositories; the output never names them, only how
             GH_TOKEN: ${{ secrets.AGENT_USAGE_TOKEN }}
             AGENT_USAGE_RELATED: ${{ secrets.AGENT_USAGE_RELATED }}
           run: |
-            curl -fsSLo "$RUNNER_TEMP/agent-usage" https://raw.githubusercontent.com/1zun4/agent-usage/v1.1.0/agent-usage
-            echo "c5c7a8335d239abcfea7ba5b61ff889b0903bb6f3543a903274aa8c33441f57d  $RUNNER_TEMP/agent-usage" | sha256sum -c -
+            curl -fsSLo "$RUNNER_TEMP/agent-usage" https://raw.githubusercontent.com/1zun4/agent-usage/v1.2.0/agent-usage
+            echo "4dd8f5dbac6dc84c3552d038f9311061e4216a77e79c843cf68511aa76be7011  $RUNNER_TEMP/agent-usage" | sha256sum -c -
             python3 "$RUNNER_TEMP/agent-usage" summary --json > "$RUNNER_TEMP/ai-usage.json"
   ```
 
@@ -60,7 +61,6 @@ The totals can include other repositories; the output never names them, only how
   Renames, imports, formatting and moves add none. Tags move with the code.
 - Model ids as the provider names them, without provider prefix: `claude-opus-5-5`, `gpt-5.6-sol`.
 - Code people wrote with AI only assisting gets no tag. Code taken from elsewhere keeps the tags it had there.
-- After adding a usage file, refresh the README totals: `agent-usage summary --update README.md`.
 
 ## Record a commit
 

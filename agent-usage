@@ -5,6 +5,7 @@
   agent-usage record <session logs or folders> [--from T] [--to T] [--change S] [--id HEX] [--dir D]
   agent-usage check [--base REF] [--include GLOB] [--exclude GLOB] [--style GLOB=STYLE] [--dir D]
   agent-usage summary [--update FILE | --json] [--related CHECKOUT|OWNER/REPO ...] [--dir D]
+  agent-usage card --out DIR --name NAME [--related CHECKOUT|OWNER/REPO ...] [--dir D]
 """
 
 import argparse
@@ -939,6 +940,157 @@ def summary_json(directory, related=()):
     return json.dumps(data, indent=2) + "\n"
 
 
+# Card
+
+# panel, border, text, muted, and the color of providers without their own
+THEMES = {
+    "dark": ("#0d1117", "#30363d", "#e6edf3", "#8b949e", "#6e7681"),
+    "light": ("#ffffff", "#d0d7de", "#1f2328", "#59636e", "#8c959f"),
+}
+PROVIDER_COLORS = {
+    "anthropic": "#d97757",
+    "deepseek": "#4d6bfe",
+    "opencode-go": "#e5484d",
+    "github-copilot": "#8957e5",
+    "openai": "#10a37f",
+}
+
+
+def escape(text):
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def dollars(usd):
+    return f"${cents(Decimal(usd)):,.2f}"
+
+
+def abbreviated(count):
+    """count with a K, M or B suffix: one decimal below 100 of the unit, none above."""
+    for size, unit in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if count >= size:
+            value = count / size
+            return (f"{value:.1f}" if value < 100 else f"{value:.0f}") + unit
+    return str(count)
+
+
+def card_svg(rows, changes, first, last, theme):
+    """The usage card: total cost, a bar of the models' shares, a row per model and the dates. Models that cost
+    nothing are left out."""
+    panel, border, text_color, muted, other = THEMES[theme]
+    rows = [row for row in rows if cents(row[3]) > 0]
+    total = sum((row[3] for row in rows), Decimal(0))
+    width, pad = 560, 20
+    bar = width - 2 * pad
+    body = []
+
+    def text(x, y, value, fill, size=13, weight=400, end=False):
+        attributes = f' font-size="{size}"' if size != 13 else ""
+        attributes += f' font-weight="{weight}"' if weight != 400 else ""
+        attributes += ' text-anchor="end"' if end else ""
+        body.append(f'<text x="{x}" y="{y}" fill="{fill}"{attributes}>{escape(value)}</text>')
+
+    text(pad, 34, "AI usage", text_color, size=14, weight=600)
+    if not rows:
+        text(pad, 62, "No usage recorded yet.", muted)
+        height = 84
+    else:
+        body.append(
+            f'<text x="{pad}" y="78" fill="{text_color}" font-size="32" font-weight="700">{escape(dollars(total))}'
+            f'<tspan font-size="20" dy="-10" fill="{muted}">*</tspan></text>'
+        )
+        text(pad, 100, "* if billed at full API rate", muted, size=12)
+        # Further models of a provider get lighter shades of its color
+        seen = {}
+        fills = []
+        for _, provider, _, _ in rows:
+            seen[provider] = seen.get(provider, 0) + 1
+            opacity = (1, 0.7, 0.5, 0.35)[min(seen[provider], 4) - 1]
+            fills.append(f'fill="{PROVIDER_COLORS.get(provider, other)}" fill-opacity="{opacity}"')
+        shares = [row[3] / total for row in rows]
+        body.append(f'<clipPath id="bar"><rect x="{pad}" y="116" width="{bar}" height="10" rx="5"/></clipPath>')
+        body.append('<g clip-path="url(#bar)">')
+        start = Decimal(0)
+        for index, share in enumerate(shares):
+            left = round(start * bar)
+            start += share
+            right = round(start * bar) - (0 if index == len(rows) - 1 else 2)
+            if right > left:
+                body.append(f'<rect x="{pad + left}" y="116" width="{right - left}" height="10" {fills[index]}/>')
+        body.append("</g>")
+        text(36, 152, "Model", muted, size=11)
+        text(220, 152, "Provider", muted, size=11)
+        text(400, 152, "Cost", muted, size=11, end=True)
+        text(466, 152, "Share", muted, size=11, end=True)
+        text(width - pad, 152, "Tokens", muted, size=11, end=True)
+        y = 152
+        for index, (model, provider, counts, usd) in enumerate(rows):
+            y += 24
+            share = shares[index]
+            body.append(f'<circle cx="{pad + 5}" cy="{y - 4.5}" r="4.5" {fills[index]}/>')
+            text(36, y, model if len(model) <= 25 else model[:24] + "…", text_color)
+            text(220, y, provider if len(provider) <= 16 else provider[:15] + "…", muted)
+            text(400, y, dollars(usd), text_color, end=True)
+            text(466, y, "<0.1%" if 0 < share < Decimal("0.0005") else f"{share * 100:.1f}%", muted, end=True)
+            text(width - pad, y, abbreviated(sum(counts.values())), muted, end=True)
+        body.append(f'<line x1="{pad}" y1="{y + 14}" x2="{width - pad}" y2="{y + 14}" stroke="{border}"/>')
+        noun = "1 change" if changes == 1 else f"{changes} changes"
+        text(pad, y + 36, f"{noun}, {first}" if first == last else f"{noun}, {first} to {last}", muted, size=12)
+        height = y + 52
+    title = f"{dollars(total)}* (* if billed at full API rate)" if rows else "none recorded yet"
+    head = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        "font-family=\"-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif\" "
+        'font-size="13" style="font-variant-numeric: tabular-nums" role="img">\n'
+        f"<title>AI usage: {escape(title)}</title>\n"
+        f'<rect x="0.5" y="0.5" width="{width - 1}" height="{height - 1}" rx="10" fill="{panel}" stroke="{border}"/>'
+    )
+    return head + "\n" + "\n".join(body) + "\n</svg>\n"
+
+
+def write_card(directory, out, name, related=()):
+    """ai-usage-dark.svg, ai-usage-light.svg, ai-usage.json and an ai-usage/ page listing this repository's
+    changes, for a static site such as GitHub Pages."""
+    rows, changes, related_changes, _, first, last = totals(directory, related)
+    out.mkdir(parents=True, exist_ok=True)
+    for theme in THEMES:
+        (out / f"ai-usage-{theme}.svg").write_text(card_svg(rows, changes, first, last, theme), encoding="utf-8")
+    (out / "ai-usage.json").write_text(summary_json(directory, related) if rows else "{}\n", encoding="utf-8")
+    changes_rows = []
+    for file in sorted(usage_files(directory), key=lambda file: file.name, reverse=True):
+        data = load(file)
+        models = ", ".join(model["model"] for model in data["models"])
+        usd = sum((Decimal(model["usd"]) for model in data["models"]), Decimal(0))
+        changes_rows.append(
+            f"<tr><td>{escape(data['date'])}</td><td>{escape(data['change'])}</td>"
+            f"<td>{escape(models)}</td><td>{dollars(usd)}</td></tr>"
+        )
+    noun = "change" if related_changes == 1 else "changes"
+    hidden = (
+        f"<p>The totals also count {related_changes} {noun} in related projects that are not public.</p>\n"
+        if related_changes
+        else ""
+    )
+    page = (
+        '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>AI usage of {escape(name)}</title>\n"
+        "<style>body{font:15px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif;"
+        "max-width:860px;margin:2rem auto;padding:0 1rem;color:#1f2328}table{border-collapse:collapse;width:100%}"
+        "td,th{text-align:left;padding:.3rem .6rem;border-bottom:1px solid #d0d7de}td:last-child{text-align:right}"
+        "@media(prefers-color-scheme:dark){body{background:#0d1117;color:#e6edf3}td,th{border-color:#30363d}}"
+        "</style>\n</head>\n<body>\n"
+        f"<h1>AI usage of {escape(name)}</h1>\n<p><picture>\n"
+        '<source media="(prefers-color-scheme: dark)" srcset="../ai-usage-dark.svg">\n'
+        f'<img alt="AI models used in {escape(name)} and their cost" src="../ai-usage-light.svg">\n</picture></p>\n'
+        "<table>\n<thead><tr><th>Date</th><th>Change</th><th>Models</th><th>Cost</th></tr></thead>\n<tbody>\n"
+        + "\n".join(changes_rows)
+        + f"\n</tbody>\n</table>\n{hidden}"
+        '<p>Totals per model as JSON: <a href="../ai-usage.json">ai-usage.json</a></p>\n</body>\n</html>\n'
+    )
+    (out / "ai-usage").mkdir(exist_ok=True)
+    (out / "ai-usage" / "index.html").write_text(page, encoding="utf-8")
+
+
 def update_summary(file, table):
     """Replaces the text between the summary markers in file; returns whether it changed."""
     text = file.read_text(encoding="utf-8")
@@ -988,14 +1140,16 @@ def main(argv=None):
     output = summary_parser.add_mutually_exclusive_group()
     output.add_argument("--update", type=Path, help=f"put the table between {SUMMARY_START} and {SUMMARY_END}")
     output.add_argument("--json", action="store_true", help="print the totals as JSON instead of a table")
-    summary_parser.add_argument(
-        "--related",
-        action="extend",
-        nargs="+",
-        default=[],
-        help=f"also count these repositories (checkouts or OWNER/REPO on GitHub), besides {RELATED_ENV} and the "
-        f"related list in the usage folder's {CONFIG_FILE}; never named in the output",
+    related_help = (
+        f"also count these repositories (checkouts or OWNER/REPO on GitHub), besides {RELATED_ENV} and the "
+        f"related list in the usage folder's {CONFIG_FILE}; never named in the output"
     )
+    summary_parser.add_argument("--related", action="extend", nargs="+", default=[], help=related_help)
+
+    card_parser = commands.add_parser("card", help="the totals as SVG cards and a page, for a static site")
+    card_parser.add_argument("--out", type=Path, required=True, help="folder the files are written to")
+    card_parser.add_argument("--name", required=True, help="the project's name, for the page and the image text")
+    card_parser.add_argument("--related", action="extend", nargs="+", default=[], help=related_help)
 
     args = parser.parse_args(argv)
     args.dir = args.dir or default_usage_dir()
@@ -1018,6 +1172,9 @@ def main(argv=None):
                 print("agent-usage check failed:\n" + "\n".join(f"- {problem}" for problem in problems), file=sys.stderr)
                 return 1
             print(f"agent-usage check passed ({len(usage_files(root / args.dir))} usage files).")
+        elif args.command == "card":
+            write_card(args.dir, args.out, args.name, args.related)
+            print(f"Wrote the AI usage card to {args.out}")
         elif args.json:
             print(summary_json(args.dir, args.related), end="")
         elif args.update:

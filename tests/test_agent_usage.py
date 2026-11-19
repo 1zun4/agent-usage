@@ -463,6 +463,21 @@ class RelatedTest(unittest.TestCase):
         self.assertEqual(data["models"][0]["model"], "claude-opus-5-5")
         self.assert_private(output)
 
+    def test_card(self):
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out)
+        au.write_card(FIXTURES / "agent-usage", out, "Demo <Add-on>", [str(self.secret)])
+        light = (out / "ai-usage-light.svg").read_text()
+        self.assertIn("$447.16", light)
+        self.assertIn("3 changes, 2026-11-09 to 2026-11-15", light)
+        self.assertIn('fill="#10a37f"', light)
+        page = (out / "ai-usage" / "index.html").read_text()
+        self.assertIn("AI models used in Demo &lt;Add-on&gt; and their cost", page)
+        self.assertIn("1 change in related projects", page)
+        self.assertEqual(json.loads((out / "ai-usage.json").read_text())["usd"], 447.16)
+        for file in out.rglob("*.*"):
+            self.assert_private(file.read_text())
+
     def github_entries(self):
         return [
             {"name": "2026-11-15-0badc0de.json", "type": "blob", "object": {"text": json.dumps(SECRET_USAGE), "isTruncated": False}},

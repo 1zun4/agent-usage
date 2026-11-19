@@ -9,7 +9,7 @@ One Python 3.11+ script, no dependencies. Agents adding it to a project can foll
 ## Install
 
 ```sh
-curl -fsSLo agent-usage https://raw.githubusercontent.com/1zun4/agent-usage/v1.1.0/agent-usage
+curl -fsSLo agent-usage https://raw.githubusercontent.com/1zun4/agent-usage/v1.2.0/agent-usage
 chmod +x agent-usage
 ```
 
@@ -142,13 +142,70 @@ masked in the public logs; repository variables are not.
           GH_TOKEN: ${{ secrets.AGENT_USAGE_TOKEN }}
           AGENT_USAGE_RELATED: ${{ secrets.AGENT_USAGE_RELATED }}
         run: |
-          curl -fsSLo "$RUNNER_TEMP/agent-usage" https://raw.githubusercontent.com/1zun4/agent-usage/v1.1.0/agent-usage
-          echo "c5c7a8335d239abcfea7ba5b61ff889b0903bb6f3543a903274aa8c33441f57d  $RUNNER_TEMP/agent-usage" | sha256sum -c -
+          curl -fsSLo "$RUNNER_TEMP/agent-usage" https://raw.githubusercontent.com/1zun4/agent-usage/v1.2.0/agent-usage
+          echo "4dd8f5dbac6dc84c3552d038f9311061e4216a77e79c843cf68511aa76be7011  $RUNNER_TEMP/agent-usage" | sha256sum -c -
           python3 "$RUNNER_TEMP/agent-usage" summary --json > "$RUNNER_TEMP/ai-usage.json"
 ```
 
 Secrets are not passed to workflows of pull requests from forks, so run it on pushes or on a schedule, not on
 `pull_request`.
+
+## Card
+
+```sh
+./agent-usage card --out site --name "My Project"
+```
+
+Writes the totals as an image for a README, plus a page listing every change: `ai-usage-dark.svg`,
+`ai-usage-light.svg`, `ai-usage.json` (the `summary --json` output) and `ai-usage/index.html`. `--related` and
+`AGENT_USAGE_RELATED` count related repositories as in `summary`; the page only says how many changes came from
+them. A GitHub Pages workflow that publishes it:
+
+```yaml
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths: ['.agent-usage/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency: pages
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: github-pages
+    steps:
+      - uses: actions/checkout@v7
+      - name: AI usage card
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/agent-usage" https://raw.githubusercontent.com/1zun4/agent-usage/v1.2.0/agent-usage
+          echo "4dd8f5dbac6dc84c3552d038f9311061e4216a77e79c843cf68511aa76be7011  $RUNNER_TEMP/agent-usage" | sha256sum -c -
+          python3 "$RUNNER_TEMP/agent-usage" card --out "$RUNNER_TEMP/site" --name "My Project"
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: ${{ runner.temp }}/site
+      - uses: actions/deploy-pages@v5
+```
+
+The README then shows it, dark or light as the reader's GitHub:
+
+```html
+<a href="https://OWNER.github.io/REPO/ai-usage/">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://OWNER.github.io/REPO/ai-usage-dark.svg">
+    <img alt="AI models used in My Project and their cost" src="https://OWNER.github.io/REPO/ai-usage-light.svg">
+  </picture>
+</a>
+```
 
 ## License
 
